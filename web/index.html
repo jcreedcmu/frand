@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>frand</title>
+    <style>
+      :root {
+        color-scheme: dark;
+      }
+      body {
+        margin: 0;
+        background: #15171c;
+        color: #e8e8ea;
+        font: 14px/1.4 system-ui, sans-serif;
+      }
+      #bar {
+        display: flex;
+        gap: 8px;
+        align-items: center;
+        padding: 10px 12px;
+      }
+      #status {
+        color: #9aa0ab;
+      }
+      canvas {
+        display: block;
+        width: calc(100vw - 24px);
+        max-width: 1600px;
+        margin: 0 12px;
+        aspect-ratio: 16 / 9;
+        background: #1d2027;
+        border: 1px solid #333843;
+        border-radius: 4px;
+        cursor: crosshair;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="bar">
+      <input id="name" placeholder="name" autocomplete="off" />
+      <button id="join">Join</button>
+      <span id="status">not connected</span>
+    </div>
+    <canvas id="world"></canvas>
+    <div id="sinks" hidden></div>
+    <script type="module" src="./dist/main.js"></script>
+  </body>
+</html>
