@@ -2,51 +2,84 @@
 
 A minimal multiplayer sandbox whose purpose is to validate that
 proximity-based voice chat feels good for a group of 5-8 friends.
-Players are dots on a flat plane. Clicking the plane sets a player's position.
-Everyone hears everyone else at a volume determined by
-distance.
+Players are dots on a flat plane. Clicking the plane moves your dot
+there immediately. Everyone hears everyone else at a volume determined
+by distance.
 
 Game mechanics beyond movement are deliberately absent. Security,
-moderation, matchmaking, and lobby scaling are out of scope.
+moderation, matchmaking, and lobby scaling are out of scope. Movement
+latency is not a concern and is not hidden: no prediction, no
+interpolation, no easing. The only thing being evaluated is the audio.
 
 ## Architecture
 
-Three processes on one box.
+Two processes on one box.
 
 ```
-browser (TypeScript)                  server box
+browser (TypeScript)                      server box
 ┌────────────────────────┐
-│ canvas render          │   wss     ┌──────────────────────────┐
-│ click -> move          │<--------->│ Rust (axum)              │
-│ snapshot -> positions  │           │  game loop, 20Hz         │
-│                        │           │  authoritative state     │
-│ livekit-client         │           │  mints LiveKit JWTs      │
-│  mic publish           │           └──────────────────────────┘
-│  remote tracks ────────┼─┐
-│  WebAudio: src->gain   │ │ wss +   ┌──────────────────────────┐
-└────────────────────────┘ └─UDP────>│ livekit-server (docker)  │
-                                     │  SFU, not game-aware     │
-                                     └──────────────────────────┘
-                                     ┌──────────────────────────┐
-                                     │ Caddy: TLS termination   │
-                                     └──────────────────────────┘
+│ canvas render          │          wss  ┌──────────────────────────┐
+│ click -> position      │<------------->│ Rust (axum)      :8080   │
+│ snapshot -> positions  │               │  authoritative state     │
+│                        │               │  mints LiveKit JWTs      │
+│ livekit-client         │               └──────────────────────────┘
+│  mic publish           │
+│  remote tracks ────────┼─┐     wss     ┌──────────────────────────┐
+│  WebAudio: src->gain   │ ├────────────>│ livekit-server   :7880   │
+└────────────────────────┘ │             │  SFU, not game-aware     │
+                           └────UDP─────>│                  :7882   │
+                                         └──────────────────────────┘
 ```
 
-The Rust server never touches audio. It holds game state and hands out
+The Rust server never touches audio. It holds positions and hands out
 room tokens. LiveKit forwards Opus streams and knows nothing about
 positions. All spatial audio math happens in the browser, which is the
 only place that has both the positions and the audio nodes.
 
-Clients are connected to the SFU, never to each other, so the only NAT
+Clients connect to the SFU, never to each other, so the only NAT
 traversal required is browser to public-IP server on a known port.
+
+### Why spatialization is client-side
+
+Mixing on the server would require time-aligning every incoming
+stream, since samples cannot be summed until they share a clock. That
+means a playout clock and a jitter buffer per participant on the
+server, in addition to the one each browser already has.
+
+It would also mean abandoning LiveKit, because an SFU exists precisely
+in order not to decode. The alternatives are a Rust WebRTC stack
+(`webrtc-rs`, `str0m`) or hand-rolled Opus over WebSocket with a WASM
+codec. Either way, jitter buffering, packet loss concealment, and
+clock drift between eight independent capture devices become code in
+this repository rather than code in the browser.
+
+Client-side also makes filter experiments a page reload instead of a
+server deploy, which matters because tuning filters by ear is the
+reason the prototype exists.
+
+Bandwidth is not a factor at this size. Seven inbound Opus streams is
+roughly 200kbps, and less in practice since DTX means silent
+participants transmit almost nothing.
+
+Commercial games also spatialize on the client, though for reasons
+that mostly do not apply here: listener head orientation changes
+faster than a network tick, per-listener mutes and volume trims are
+local state, and voice has to be summed with the client's own sound
+effects through a shared bus chain. The decision above rests on the
+time-alignment and dependency arguments, not on the comparison.
 
 ### Authority model
 
-The server owns every player's position. Clients send intent
-(a click target) and render what comes back. No client-side prediction
-in this prototype: one authoritative copy of state makes divergence
-bugs impossible, which matters more than input latency when the thing
-under test is audio.
+The server owns every player's position. Clients send a click target
+and render what comes back. Because movement is instantaneous there is
+no integration step and therefore no tick loop: a `move` message
+updates one position and triggers one broadcast. Positions change a
+few times per second across the whole group.
+
+The visible consequence is that your own dot does not move until the
+round trip completes. That is intended. One authoritative copy of
+state makes divergence bugs impossible, and a local echo would be the
+first thing to mislead a debugging session.
 
 ## Identity
 
@@ -62,13 +95,11 @@ join on.
 
 ## Protocol
 
-JSON text frames over one WebSocket. At 8 players and 20Hz this is a
-few KB/s, so a binary encoding would add work without buying anything.
+JSON text frames over one WebSocket.
 
-Client connects to `/ws?name=jcreed`. Server assigns an id and replies
-with everything the client needs, including the LiveKit credentials,
-so there is no separate token endpoint and no second thing to
-authenticate.
+Client connects to `/ws?name=jcreed`. The server assigns an id and
+replies with everything the client needs, including LiveKit
+credentials, so there is no separate token endpoint.
 
 Server to client:
 
@@ -82,21 +113,23 @@ Server to client:
   "world": { "w": 1600, "h": 1200 },
   "audio": { "full_gain_radius": 150, "silence_radius": 600 } }
 
-// 20Hz
+// on any position change, and once after welcome
 { "t": "state",
-  "seq": 1234,
   "players": [ { "id": "p4f2", "name": "jcreed", "x": 812.0, "y": 377.5 } ] }
 ```
 
 Client to server:
 
 ```jsonc
-{ "t": "move", "x": 900.0, "y": 410.0 }   // walk destination
+{ "t": "move", "x": 900.0, "y": 410.0 }
 ```
 
+Snapshots carry the full player list rather than deltas. At this size
+it is smaller than the bookkeeping a delta scheme would need.
+
 Tuning constants live in `welcome` rather than being hardcoded in the
-frontend, so that audio falloff can be adjusted server-side and picked
-up by everyone on reconnect.
+frontend, so audio falloff can be adjusted server-side and picked up
+by everyone on reconnect.
 
 A player is created when the WebSocket opens and destroyed when it
 closes. There is no persistence and no reconnect handling: a dropped
@@ -106,53 +139,54 @@ client comes back as a new player.
 
 `server/`, single crate, no workspace.
 
-Dependencies: `axum` with the `ws` feature, `tokio` with `full`,
-`serde` + `serde_json`, `jsonwebtoken`, `tracing` +
-`tracing-subscriber`, `rand`. Pin to whatever is current on crates.io
-at implementation time.
+Dependencies: `axum` with the `ws` feature, `tokio` with `rt-multi-thread`
+and `macros`, `serde` + `serde_json`, `jsonwebtoken`, `tower-http` with
+`fs`, `tracing` + `tracing-subscriber`, `rand`. Pin to whatever is
+current on crates.io at implementation time.
 
 ```
 server/
   Cargo.toml
   src/main.rs     axum setup, routes, static file serving
   src/proto.rs    serde types for the messages above
-  src/state.rs    World, Player, tick integration
+  src/state.rs    World, Player, snapshot serialization
   src/ws.rs       per-connection task
   src/token.rs    LiveKit JWT minting
 ```
 
-### State and the tick loop
+### State
 
 ```rust
-struct Player { id: String, name: String, pos: Vec2, target: Vec2 }
+struct Player { id: String, name: String, x: f32, y: f32 }
 struct World  { players: HashMap<String, Player> }
 ```
 
-Shared as `Arc<RwLock<World>>`. One task holds a
-`tokio::time::interval(Duration::from_millis(50))`; each tick it takes
-the write lock, moves every player toward its target by
-`SPEED * 0.05` (clamped so it cannot overshoot), serializes one
-snapshot string, and publishes it through a
-`tokio::sync::watch::channel::<String>`.
+Shared as `Arc<RwLock<World>>`, paired with a
+`tokio::sync::watch::channel::<String>` holding the latest serialized
+snapshot.
 
-`watch` rather than `broadcast`: it keeps only the latest value, so a
-slow client simply misses intermediate snapshots instead of producing
-lag errors that have to be handled. Stale snapshots have no value in a
-position feed.
+Any mutation (join, move, leave) takes the write lock, applies the
+change, serializes one snapshot, and publishes it to the watch channel.
+Serializing once per change rather than once per client keeps the cost
+flat in player count.
 
-Each connection runs two halves with `tokio::select!`: one awaiting
-`watch::Receiver::changed()` and forwarding the snapshot, one reading
-client frames and writing the player's `target`. Serializing once per
-tick rather than once per client keeps the tick cost flat.
+`watch` rather than `broadcast`: it holds only the latest value, so a
+slow client misses intermediate snapshots instead of producing lag
+errors that need handling. A stale position snapshot has no value.
 
-Target clicks are clamped to the world bounds. That is the only
-validation needed.
+Each connection runs two halves under `tokio::select!`: one awaiting
+`watch::Receiver::changed()` and forwarding, one reading client frames
+and applying moves. Click targets are clamped to the world bounds,
+which is the only validation needed.
 
 ### Token minting
 
-A LiveKit access token is an HS256 JWT signed with the API secret.
-Minting it directly with `jsonwebtoken` is about twenty lines and
-avoids pulling in the full `livekit-api` crate and its protobuf tree.
+A LiveKit access token is an HS256 JWT signed with the API secret. The
+token is not providing security here, since there is nothing to
+protect; it is how LiveKit is told which room to join and what
+identity to use. LiveKit has no unauthenticated mode, so the
+requirement is unavoidable, but it stays at about twenty lines with
+`jsonwebtoken` and a long expiry means refresh never comes up.
 
 ```rust
 #[derive(Serialize)]
@@ -164,19 +198,19 @@ struct Grant { room: String, #[serde(rename = "roomJoin")] room_join: bool,
 struct Claims { iss: String,   // API key
                 sub: String,   // player id, becomes participant identity
                 name: String,  // display name
-                nbf: u64, exp: u64,
+                nbf: u64, exp: u64,  // exp: now + 24h
                 video: Grant }
 ```
 
 `LIVEKIT_API_KEY`, `LIVEKIT_API_SECRET`, and `LIVEKIT_URL` come from
-the environment. Six hour expiry is plenty for a play session.
+the environment. Using `livekit-api` instead would pull in a protobuf
+tree to save a struct definition.
 
 ### Static serving
 
 In production axum serves `web/dist` via `tower-http`'s `ServeDir`
 with an index fallback. In development Vite serves the frontend on
-5173 and proxies `/ws` to the Rust server, so only one dev command
-changes per edit.
+5173 and proxies `/ws` to the Rust server.
 
 ## Frontend
 
@@ -186,7 +220,7 @@ changes per edit.
 ```
 web/
   index.html      canvas, join button, hidden <div id="sinks">
-  src/main.ts     join flow, animation frame loop
+  src/main.ts     join flow, render loop
   src/net.ts      WebSocket, snapshot store
   src/audio.ts    LiveKit room, per-peer audio chains
   src/render.ts   canvas drawing, click to world coords
@@ -194,7 +228,7 @@ web/
 
 ### Join flow
 
-Everything is behind a Join button because an `AudioContext` created
+Everything sits behind a Join button because an `AudioContext` created
 outside a user gesture starts suspended, and `getUserMedia` wants a
 gesture too. On click, in order:
 
@@ -241,8 +275,8 @@ type PeerAudio = {
 
 ### Distance to gain
 
-Once per animation frame, for each peer with both a chain and a
-position:
+Recomputed when a snapshot arrives, since that is the only time
+positions change:
 
 ```ts
 const d = Math.hypot(me.x - them.x, me.y - them.y);
@@ -251,9 +285,10 @@ chain.gain.gain.setTargetAtTime(g, ctx.currentTime, 0.05);
 ```
 
 `setTargetAtTime` rather than assigning `.value`: direct assignment
-steps the gain and produces audible zipper noise on every update. The
-50ms time constant is the knob to turn if transitions feel abrupt or
-mushy.
+steps the gain and produces audible zipper noise. With instantaneous
+movement the 50ms time constant is doing real work, since it turns
+what would be a click on every teleport into a fast fade. It is the
+knob to turn if transitions sound abrupt or mushy.
 
 Linear falloff is the starting point because it is easy to reason
 about while tuning. Swapping in an inverse or exponential curve is a
@@ -261,25 +296,46 @@ one-line change once there is a feel to compare against.
 
 ### Rendering
 
-Canvas 2D. Each player is a circle; the local player is outlined.
-Draw two rings around the local player at `full_gain_radius` and
-`silence_radius` so the audio falloff is visible while walking, which
-makes "does this sound right" answerable by looking.
-
-Drawn positions ease toward authoritative ones:
-
-```ts
-drawn.x += (auth.x - drawn.x) * 0.2;
-```
+Canvas 2D. Each player is a circle drawn at its authoritative
+position; the local player is outlined. Draw two rings around the
+local player at `full_gain_radius` and `silence_radius` so falloff is
+visible while moving, which makes "does this sound right" answerable
+by looking.
 
 A click converts canvas coordinates to world coordinates and sends a
-`move`. Draw a small marker at the pending destination.
+`move`.
 
-Also render each peer's current gain as a number next to its dot
-during bring-up. Seeing the value makes it obvious whether a silence
-problem is in the math or in the audio graph.
+Render each peer's current gain as a number next to its dot during
+bring-up. Seeing the value makes it obvious whether a silence problem
+is in the math or in the audio graph.
 
 ## Deployment
+
+Four things must be reachable from a player's browser:
+
+- the frontend, over HTTPS
+- the game WebSocket, over WSS
+- LiveKit signaling, over WSS, proxied to `:7880`
+- LiveKit media, over UDP `:7882`, with TCP `:7881` as a fallback
+
+The first three are ordinary HTTPS serving. Anything that terminates
+TLS with a valid certificate and proxies WebSockets is fine: nginx,
+Caddy, a managed ingress, or the Rust server itself holding the certs
+and proxying LiveKit. This plan assumes such a setup exists and does
+not specify it.
+
+Two facts constrain the choice, and only these two:
+
+- `getUserMedia` requires a secure context, so HTTPS is not optional
+  for any player who is not on the host machine.
+- Media is UDP and involves no certificate, since DTLS-SRTP keys are
+  self-signed with fingerprints carried in the SDP. An ingress that
+  forwards only HTTP and WebSocket will carry signaling but not media,
+  so the media port needs a direct path to the host.
+
+Whatever address LiveKit advertises in its ICE candidates must be one
+clients can actually reach. `rtc.use_external_ip: true` makes it
+discover its own public address; `rtc.node_ip` sets it explicitly.
 
 `docker-compose.yml` runs `livekit/livekit-server` with
 `network_mode: host`, mounting `livekit/livekit.yaml`:
@@ -296,43 +352,38 @@ keys:
 A single muxed UDP port keeps the firewall rule to one line instead of
 a ten-thousand-port range.
 
-Caddy terminates TLS for both HTTP services:
+Resource use is small. The Rust server is idle at this scale and the
+SFU carries roughly 8 inbound streams plus 56 outbound, a few Mbps.
+The smallest VPS tier is adequate.
 
-```
-game.example.com { reverse_proxy localhost:8080 }
-sfu.example.com  { reverse_proxy localhost:7880 }
-```
+Local development needs no certificate, since `localhost` is a secure
+context: Vite on `:5173`, the Rust server on `:8080`, LiveKit at
+`ws://localhost:7880`, and `use_external_ip: false`.
 
-UDP 7882 is opened directly and not proxied. Browsers refuse
-non-TLS WebSocket connections to LiveKit anywhere but localhost, so
-the certificate has to exist before anyone outside the dev machine can
-join.
+### Access
 
-Resource use is small. The Rust server is idle at this scale, and the
-SFU carries roughly 8 inbound Opus streams plus 56 outbound, about
-2-3 Mbps total. The smallest VPS tier is adequate.
-
-Local development skips Caddy entirely: `http://localhost:5173` for
-the frontend, `ws://localhost:7880` for LiveKit, with
-`use_external_ip: false`.
+The game server hands a LiveKit token to anyone who opens the
+WebSocket, so reaching the hostname is sufficient to join and talk.
+A shared secret in the connect query string, checked by the Rust
+server, is about ten lines if that matters.
 
 ## Build order
 
-Each step ends in something runnable, and each one isolates a
-different failure domain.
+Each step ends in something runnable, and each isolates a different
+failure domain.
 
-**1. Movement, no audio.** Rust tick loop, WebSocket, canvas, click to
-move. Done when two browser tabs show each other's dots walking and
-the motion looks smooth.
+**1. Movement, no audio.** WebSocket, broadcast on change, canvas,
+click to move. Done when two browser tabs show each other's dots
+jumping to clicked positions.
 
 **2. Voice, no spatialization.** LiveKit in docker, mic publish, every
 peer at gain 1.0. Done when 5-8 friends on their real home networks
-can all hear each other. This is the step that tests NAT traversal and
-it is kept separate so that a connection failure cannot be confused
-with an audio-graph failure.
+can all hear each other. This step tests NAT traversal and the
+deployment's media path, and is kept separate so a connection failure
+cannot be confused with an audio-graph failure.
 
 **3. Distance gain.** Wire positions into the gain nodes, draw the
-radius rings. Done when walking away from someone audibly fades them
+radius rings. Done when moving away from someone audibly fades them
 out and the falloff feels right after tuning the two radii.
 
 **4. Filters and panning.** Insert a `StereoPannerNode` (or
@@ -348,8 +399,7 @@ prototype exists to enable.
 
 - **Speakers cause echo.** Browser AEC is on, but with 8 participants
   on open speakers there will be feedback and talk-over. Require
-  headphones for the first group test or the session becomes an echo
-  debugging session.
+  headphones for the first group test.
 - **Silence with no error** almost always means the missing muted
   `<audio>` sink, or a chain accidentally built for the local
   participant, or an `AudioContext` that was never resumed. Check in
@@ -357,5 +407,9 @@ prototype exists to enable.
 - **Identity mismatch** between the WebSocket player id and the
   LiveKit participant identity produces audio at full volume that
   never attenuates, because no position is ever found for the peer.
+- **Blocked UDP on a player's network** makes LiveKit fall back to
+  ICE over TCP on `:7881`. If one person cannot connect while everyone
+  else can, check that this port is reachable before looking anywhere
+  else.
 - **Firefox and Safari** will mostly work but are not worth debugging
-  during bring-up. Standardize the group on Chrome for the first test.
+  during bring-up. Standardize on Chrome for the first group test.
