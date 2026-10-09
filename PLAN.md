@@ -8,110 +8,119 @@ by distance.
 
 Game mechanics beyond movement are deliberately absent. Security,
 moderation, matchmaking, and lobby scaling are out of scope. Movement
-latency is not a concern and is not hidden: no prediction, no
-interpolation, no easing. The only thing being evaluated is the audio.
+latency is neither hidden nor smoothed: no prediction, no
+interpolation, no easing. The only thing under evaluation is the
+audio.
+
+## Assumptions
+
+- The lobby is capped at 8 players, known in advance and never
+  exceeded. Several simplifications below depend on this bound.
+- Players are on desktop machines with ordinary residential broadband,
+  so outbound UDP to an arbitrary port works. No TURN server, no ICE
+  over TCP, no relay fallback of any kind. The failure symptom if this
+  assumption breaks for one person is in Known Hazards.
+- Players are trusted. There is no authentication.
 
 ## Architecture
 
-Two processes on one box.
+One Rust binary. One WebSocket and one UDP flow per browser.
 
 ```
-browser (TypeScript)                      server box
-┌────────────────────────┐
-│ canvas render          │          wss  ┌──────────────────────────┐
-│ click -> position      │<------------->│ Rust (axum)      :8080   │
-│ snapshot -> positions  │               │  authoritative state     │
-│                        │               │  mints LiveKit JWTs      │
-│ livekit-client         │               └──────────────────────────┘
-│  mic publish           │
-│  remote tracks ────────┼─┐     wss     ┌──────────────────────────┐
-│  WebAudio: src->gain   │ ├────────────>│ livekit-server   :7880   │
-└────────────────────────┘ │             │  SFU, not game-aware     │
-                           └────UDP─────>│                  :7882   │
-                                         └──────────────────────────┘
+browser (TypeScript)                      server: one Rust binary
+┌──────────────────────────┐              ┌────────────────────────────┐
+│ canvas render            │              │ axum                       │
+│ click -> position        │              │   static files             │
+│ offer / answer / slots   │<--- wss ---->│   game socket              │
+│                          │              │   positions (RwLock)       │
+│                          │              │   slot assignment          │
+│ RTCPeerConnection        │              ├────────────────────────────┤
+│  1 sendonly (mic)        │              │ str0m task                 │
+│  7 recvonly              │----- UDP --->│   one Rtc per player       │
+│ WebAudio: 7x src->gain   │ (DTLS-SRTP)  │   forward Opus payloads    │
+└──────────────────────────┘              └────────────────────────────┘
 ```
 
-The Rust server never touches audio. It holds positions and hands out
-room tokens. LiveKit forwards Opus streams and knows nothing about
-positions. All spatial audio math happens in the browser, which is the
-only place that has both the positions and the audio nodes.
+The two halves live in one process and talk over an `mpsc` channel.
+The SFU half is built on `str0m`: it decrypts incoming RTP,
+forwards the Opus payloads to every other participant, and re-encrypts
+per connection. It never decodes audio. All spatial processing happens
+in the browser, which is the only place holding both the positions and
+the audio nodes.
 
-Clients connect to the SFU, never to each other, so the only NAT
-traversal required is browser to public-IP server on a known port.
+Clients connect to the server, never to each other. There is no peer
+to peer anything, so the only ICE case that arises is a browser
+reaching a host with a public address, which is the easy direction.
 
-### Why spatialization is client-side
+### Why the server forwards rather than mixes
 
-Mixing on the server would require time-aligning every incoming
-stream, since samples cannot be summed until they share a clock. That
-means a playout clock and a jitter buffer per participant on the
-server, in addition to the one each browser already has.
+Owning the SFU makes server-side mixing superficially attractive,
+since the RTP is already in hand. It would cost a great deal more:
+Opus decode for every participant, a playout clock and jitter buffer
+per stream so samples can be time-aligned before summing, a separate
+mix per listener, and an encode per listener. Forwarding payloads
+touches no codec at all.
 
-It would also mean abandoning LiveKit, because an SFU exists precisely
-in order not to decode. The alternatives are a Rust WebRTC stack
-(`webrtc-rs`, `str0m`) or hand-rolled Opus over WebSocket with a WASM
-codec. Either way, jitter buffering, packet loss concealment, and
-clock drift between eight independent capture devices become code in
-this repository rather than code in the browser.
+Forwarding also passes Opus in-band FEC and DTX through end to end
+untouched, so packet loss concealment and silence suppression keep
+working without any involvement from this code.
 
-Client-side also makes filter experiments a page reload instead of a
-server deploy, which matters because tuning filters by ear is the
-reason the prototype exists.
-
-Bandwidth is not a factor at this size. Seven inbound Opus streams is
-roughly 200kbps, and less in practice since DTX means silent
-participants transmit almost nothing.
-
-Commercial games also spatialize on the client, though for reasons
-that mostly do not apply here: listener head orientation changes
-faster than a network tick, per-listener mutes and volume trims are
-local state, and voice has to be summed with the client's own sound
-effects through a shared bus chain. The decision above rests on the
-time-alignment and dependency arguments, not on the comparison.
+The remaining argument is iteration speed. Tuning filters by ear is
+the reason the prototype exists, and in the browser that is a page
+reload rather than a deploy.
 
 ### Authority model
 
 The server owns every player's position. Clients send a click target
 and render what comes back. Because movement is instantaneous there is
-no integration step and therefore no tick loop: a `move` message
-updates one position and triggers one broadcast. Positions change a
-few times per second across the whole group.
+no integration step and so no tick loop: a `move` message updates one
+position and triggers one broadcast.
 
-The visible consequence is that your own dot does not move until the
-round trip completes. That is intended. One authoritative copy of
-state makes divergence bugs impossible, and a local echo would be the
-first thing to mislead a debugging session.
+Your own dot does not move until the round trip completes. That is
+intended. One authoritative copy of state makes divergence bugs
+impossible, and a local echo would be the first thing to mislead a
+debugging session.
 
-## Identity
+## Identity and slots
 
-One id per player, generated by the Rust server, used as:
+Each player gets an id generated by the server on connect. It keys the
+player map and appears in state snapshots.
 
-- the key in the server's player map
-- the `id` field in state snapshots
-- the LiveKit participant identity (JWT `sub` claim)
+Audio routing uses a second, separate concept. Every peer connection
+is negotiated once with a fixed set of **7 receive slots**, each slot
+being one `recvonly` audio m-line identified by its `mid`. The server
+assigns each other player to one of the listener's slots and tells the
+listener which slot holds whom.
 
-Using the same string for all three is what lets the browser map an
-incoming audio track to a position. Without it there is nothing to
-join on.
+This is what the 8-player bound buys. Slots are allocated up front, so
+a player joining or leaving never triggers SDP renegotiation, and the
+browser's 7 audio chains are built once at join and never torn down.
+A slot with no occupant simply carries no traffic and sits at zero
+gain.
 
 ## Protocol
 
-JSON text frames over one WebSocket.
+JSON text frames over one WebSocket. Signaling rides the same socket
+as game state, so there is no second connection and nothing to
+authenticate.
 
-Client connects to `/ws?name=jcreed`. The server assigns an id and
-replies with everything the client needs, including LiveKit
-credentials, so there is no separate token endpoint.
+Client connects to `/ws?name=jcreed`.
 
 Server to client:
 
 ```jsonc
-// once, immediately on connect
 { "t": "welcome",
   "id": "p4f2",
-  "livekit_url": "wss://sfu.example.com",
-  "token": "<jwt>",
-  "room": "frand",
+  "recv_slots": 7,
   "world": { "w": 1600, "h": 1200 },
   "audio": { "full_gain_radius": 150, "silence_radius": 600 } }
+
+{ "t": "answer", "sdp": "..." }
+
+// whenever the assignment changes, and once after the answer.
+// keys are mids, null means the slot is unoccupied.
+{ "t": "slots", "slots": { "1": "p9aa", "2": "p3b1", "3": null,
+                           "4": null, "5": null, "6": null, "7": null } }
 
 // on any position change, and once after welcome
 { "t": "state",
@@ -121,28 +130,35 @@ Server to client:
 Client to server:
 
 ```jsonc
+{ "t": "offer", "sdp": "..." }
 { "t": "move", "x": 900.0, "y": 410.0 }
 ```
 
-Snapshots carry the full player list rather than deltas. At this size
-it is smaller than the bookkeeping a delta scheme would need.
+There are no ICE candidate messages in either direction. See the
+ice-lite note below.
 
-Tuning constants live in `welcome` rather than being hardcoded in the
-frontend, so audio falloff can be adjusted server-side and picked up
-by everyone on reconnect.
+Snapshots carry the full player list rather than deltas, which at this
+size is smaller than the bookkeeping a delta scheme would need. Tuning
+constants travel in `welcome` so audio falloff can be adjusted
+server-side.
 
 A player is created when the WebSocket opens and destroyed when it
 closes. There is no persistence and no reconnect handling: a dropped
-client comes back as a new player.
+client comes back as a new player with a new id.
 
 ## Server
 
 `server/`, single crate, no workspace.
 
-Dependencies: `axum` with the `ws` feature, `tokio` with `rt-multi-thread`
-and `macros`, `serde` + `serde_json`, `jsonwebtoken`, `tower-http` with
-`fs`, `tracing` + `tracing-subscriber`, `rand`. Pin to whatever is
-current on crates.io at implementation time.
+Dependencies: `str0m`, `axum` with `ws`, `tokio` with
+`rt-multi-thread`/`macros`/`net`/`time`/`sync`, `serde` +
+`serde_json`, `tower-http` with `fs`, `tracing` +
+`tracing-subscriber`, `rand`.
+
+`str0m` is pre-1.0 and its API moves between releases, so pin an exact
+version. Its default crypto backend is `aws-lc-rs`, which needs a C
+toolchain and cmake; if that build is inconvenient, the `rust-crypto`
+feature is pure Rust.
 
 ```
 server/
@@ -151,60 +167,145 @@ server/
   src/proto.rs    serde types for the messages above
   src/state.rs    World, Player, snapshot serialization
   src/ws.rs       per-connection task
-  src/token.rs    LiveKit JWT minting
+  src/sfu.rs      the str0m task: Rtc instances, slots, forwarding
 ```
 
-### State
+### Two halves
 
-```rust
-struct Player { id: String, name: String, x: f32, y: f32 }
-struct World  { players: HashMap<String, Player> }
-```
+The two halves of the server share nothing but player ids.
 
-Shared as `Arc<RwLock<World>>`, paired with a
+**Game state** is an `Arc<RwLock<World>>` paired with a
 `tokio::sync::watch::channel::<String>` holding the latest serialized
-snapshot.
+snapshot. Any mutation takes the write lock, applies the change,
+serializes one snapshot, and publishes it. Serializing once per change
+rather than once per client keeps the cost flat in player count.
+`watch` rather than `broadcast` because it holds only the latest
+value, so a slow client misses intermediate snapshots instead of
+producing lag errors to handle, and a stale position has no value.
 
-Any mutation (join, move, leave) takes the write lock, applies the
-change, serializes one snapshot, and publishes it to the watch channel.
-Serializing once per change rather than once per client keeps the cost
-flat in player count.
-
-`watch` rather than `broadcast`: it holds only the latest value, so a
-slow client misses intermediate snapshots instead of producing lag
-errors that need handling. A stale position snapshot has no value.
-
-Each connection runs two halves under `tokio::select!`: one awaiting
-`watch::Receiver::changed()` and forwarding, one reading client frames
-and applying moves. Click targets are clamped to the world bounds,
-which is the only validation needed.
-
-### Token minting
-
-A LiveKit access token is an HS256 JWT signed with the API secret. The
-token is not providing security here, since there is nothing to
-protect; it is how LiveKit is told which room to join and what
-identity to use. LiveKit has no unauthenticated mode, so the
-requirement is unavoidable, but it stays at about twenty lines with
-`jsonwebtoken` and a long expiry means refresh never comes up.
+**The SFU** is one tokio task owning the UDP socket and every `Rtc`
+instance. Nothing else touches them, so no locking is needed around
+WebRTC state. WebSocket tasks talk to it over an `mpsc` carrying
+commands:
 
 ```rust
-#[derive(Serialize)]
-struct Grant { room: String, #[serde(rename = "roomJoin")] room_join: bool,
-               #[serde(rename = "canPublish")] can_publish: bool,
-               #[serde(rename = "canSubscribe")] can_subscribe: bool }
-
-#[derive(Serialize)]
-struct Claims { iss: String,   // API key
-                sub: String,   // player id, becomes participant identity
-                name: String,  // display name
-                nbf: u64, exp: u64,  // exp: now + 24h
-                video: Grant }
+enum SfuCmd {
+    Join { id: PlayerId, offer: String, reply: oneshot::Sender<String> },
+    Leave { id: PlayerId },
+}
 ```
 
-`LIVEKIT_API_KEY`, `LIVEKIT_API_SECRET`, and `LIVEKIT_URL` come from
-the environment. Using `livekit-api` instead would pull in a protobuf
-tree to save a struct definition.
+Slot assignment lives in the SFU task, which notifies WebSocket tasks
+of changes through a second channel so they can forward `slots`
+messages.
+
+### ICE-lite
+
+The server is configured `Rtc::builder().set_ice_lite(true)` and
+registers exactly one local candidate:
+
+```rust
+rtc.add_local_candidate(Candidate::host((public_ip, udp_port), "udp")?);
+```
+
+ICE-lite means the server never gathers candidates and never sends
+connectivity checks. The browser is the controlling agent, sends its
+checks to the advertised candidate, and the server replies to whatever
+source address the packets arrived from. Consequences:
+
+- No candidate trickling, so no ICE messages in the protocol.
+- The client's candidates are never used, so the client does not need
+  to wait for gathering to finish before sending its offer, and needs
+  no STUN server configured.
+- `PUBLIC_IP` must be an address clients can actually reach. This is
+  the single most likely configuration mistake.
+
+### The event loop
+
+`str0m` is sans-IO, so the loop is explicit. It enforces one rule
+worth repeating here because violating it produces subtle breakage:
+**every mutation of an `Rtc` must be followed by draining
+`poll_output` until it returns `Output::Timeout`, before the next
+mutation of that instance.**
+
+```rust
+loop {
+    tokio::select! {
+        r = socket.recv_from(&mut buf) => { /* route to one Rtc */ }
+        _ = sleep_until(next_deadline)  => { /* Input::Timeout */ }
+        Some(cmd) = cmds.recv()         => { /* Join / Leave */ }
+    }
+}
+```
+
+**Routing an incoming packet.** Build the `Input::Receive`, then find
+the owner by asking each instance `rtc.accepts(&input)`. A linear scan
+over at most 8 peers costs nothing. Packets nobody accepts are
+dropped.
+
+**Timeouts.** Each instance reports its own next deadline during the
+drain. Keep them in a map and sleep until the minimum; when it fires,
+feed `Input::Timeout(now)` to every instance whose deadline has
+passed, draining each.
+
+**Draining.** A drain sends every `Output::Transmit` to its
+destination and collects every `Output::Event`. After draining, drop
+any peer for which `rtc.is_alive()` is false.
+
+**Avoid recursion.** Handling an event from peer A involves mutating
+peer B, whose drain can itself yield events. Push events onto a single
+queue and process the queue in a loop rather than handling them
+inline, or the call stack grows with the lobby.
+
+### Forwarding
+
+`Event::MediaData` from a player carries the Opus payload for one
+frame. For each other player, look up the slot assigned to the sender
+in that listener's connection and write the payload there:
+
+```rust
+for (listener_id, listener) in peers.iter_mut() {
+    if *listener_id == sender_id { continue }
+    let Some(mid) = listener.slot_for(sender_id) else { continue };
+    let Some(writer) = listener.rtc.writer(mid) else { continue };
+    let pt = writer.payload_params().next().unwrap().pt();
+    writer.write(pt, data.network_time, data.time, &data.data)?;
+    drain(&mut listener.rtc, &socket)?;   // the mutation rule applies
+}
+```
+
+Two things that are easy to get wrong:
+
+- **Payload type is per connection.** Each peer negotiates its own
+  Opus payload type, and they need not agree. Always write with the
+  *listener's* payload type, taken from that writer's
+  `payload_params()`, never the sender's.
+- **Every `write` is a mutation**, so the listener's output must be
+  drained before anything else touches that instance.
+
+Using the frame-level `writer` API rather than `set_rtp_mode(true)`
+means `str0m` owns SSRC allocation, sequence numbering, and sender
+reports for outgoing streams. For Opus, one frame is one packet, so
+nothing is lost by working at frame granularity, and the RTCP
+bookkeeping that decides whether the receiver's jitter buffer behaves
+is handled rather than hand-rolled.
+
+### Slot allocation
+
+Each connection has 7 slots keyed by `mid`. On join, the new player is
+assigned a free slot in every existing connection, and every existing
+player is assigned a slot in the new connection. On leave, the
+departing player's slots are freed. Affected listeners get a fresh
+`slots` message.
+
+Prefer a never-used slot over recycling a freed one while any remain.
+Reassigning a slot to a different player makes the outgoing RTP
+timestamp jump, which can briefly upset the receiver's jitter buffer.
+If that turns out to be audible, the fix is a per-slot timestamp
+offset: on assignment, record the difference between the last
+timestamp written to that slot and the new occupant's current
+timestamp, and add it to everything written afterward, which keeps the
+outgoing clock continuous across occupants.
 
 ### Static serving
 
@@ -214,81 +315,106 @@ with an index fallback. In development Vite serves the frontend on
 
 ## Frontend
 
-`web/`, Vite + TypeScript, no UI framework. Dependencies: `vite`,
-`typescript`, `livekit-client`.
+`web/`, Vite + TypeScript, no UI framework and no WebRTC library.
+Dependencies: `vite`, `typescript`.
 
 ```
 web/
   index.html      canvas, join button, hidden <div id="sinks">
   src/main.ts     join flow, render loop
-  src/net.ts      WebSocket, snapshot store
-  src/audio.ts    LiveKit room, per-peer audio chains
+  src/net.ts      WebSocket, snapshot store, slot map
+  src/rtc.ts      RTCPeerConnection setup, offer/answer
+  src/audio.ts    the 7 audio chains
   src/render.ts   canvas drawing, click to world coords
 ```
 
 ### Join flow
 
-Everything sits behind a Join button because an `AudioContext` created
-outside a user gesture starts suspended, and `getUserMedia` wants a
-gesture too. On click, in order:
+Everything sits behind a Join button, because an `AudioContext`
+created outside a user gesture starts suspended and `getUserMedia`
+wants a gesture too.
 
 1. `new AudioContext()`, then `await ctx.resume()`
-2. open the WebSocket, await `welcome`
-3. `await room.connect(livekit_url, token)`
-4. `await room.localParticipant.setMicrophoneEnabled(true)` with
-   capture constraints `echoCancellation`, `noiseSuppression`, and
-   `autoGainControl` all true
-5. start the render loop
+2. `getUserMedia({ audio: { echoCancellation: true,
+   noiseSuppression: true, autoGainControl: true } })`
+3. open the WebSocket, await `welcome`
+4. build the peer connection and send the offer
+5. await `answer`, `setRemoteDescription`
+6. start the render loop
 
-### Per-peer audio chain
-
-On `RoomEvent.TrackSubscribed` for an audio track, build:
-
-```
-MediaStreamSource(stream) -> GainNode -> ctx.destination
-```
-
-keyed by `participant.identity`, which equals the player id. Tear the
-chain down on `TrackUnsubscribed` and on participant disconnect.
-
-Two non-obvious requirements:
-
-- The `MediaStream` must **also** be assigned to an
-  `HTMLAudioElement` with `muted = true`, kept alive in the DOM.
-  Chrome will not pull audio from a WebRTC track into Web Audio
-  otherwise, and the symptom is silence with no error. Append these
-  elements to `#sinks`.
-- Never build a chain for the local participant. Monitoring your own
-  mic is immediate feedback.
-
-Represent each chain as an object so step 4 of the build order is an
-insertion rather than a rewrite:
+### Peer connection
 
 ```ts
-type PeerAudio = {
-  stream: MediaStream;
+const pc = new RTCPeerConnection({ iceServers: [] });
+pc.addTrack(micTrack);                     // m-line 0, our mic
+for (let i = 0; i < recvSlots; i++)
+    pc.addTransceiver('audio', { direction: 'recvonly' });
+const offer = await pc.createOffer();
+await pc.setLocalDescription(offer);
+ws.send(JSON.stringify({ t: 'offer', sdp: offer.sdp }));
+```
+
+`iceServers: []` because the only candidate that matters is the
+server's, which arrives in the answer. The offer is sent immediately
+without waiting for gathering to complete, since an ice-lite server
+ignores the client's candidates.
+
+Negotiation happens exactly once. There is no `negotiationneeded`
+handling, no renegotiation, and no ICE restart.
+
+### The audio chains
+
+Seven chains, built once on `track` events and keyed by
+`event.transceiver.mid`:
+
+```
+MediaStreamSource -> GainNode -> ctx.destination
+```
+
+```ts
+type Chain = {
+  mid: string;
   sink: HTMLAudioElement;   // muted, keeps the track flowing
   source: MediaStreamAudioSourceNode;
   gain: GainNode;           // later: panner, filter in between
 };
 ```
 
+Chains are permanent for the session. Which player a chain carries
+comes from the slot map, so a join or a leave changes a lookup rather
+than the audio graph.
+
+Two non-obvious requirements:
+
+- The `MediaStream` must **also** be assigned to an
+  `HTMLAudioElement` with `muted = true`, kept alive in the DOM.
+  Chrome will not pull audio from a WebRTC track into Web Audio
+  otherwise, and the symptom is silence with no error. Append these to
+  `#sinks`.
+- Never route the local mic into the graph. Monitoring your own mic is
+  immediate feedback.
+
 ### Distance to gain
 
-Recomputed when a snapshot arrives, since that is the only time
-positions change:
+Recomputed when a `state` or `slots` message arrives, since those are
+the only times anything relevant changes:
 
 ```ts
-const d = Math.hypot(me.x - them.x, me.y - them.y);
-const g = clamp01((silenceRadius - d) / (silenceRadius - fullGainRadius));
-chain.gain.gain.setTargetAtTime(g, ctx.currentTime, 0.05);
+for (const chain of chains) {
+  const them = slotOccupant(chain.mid);
+  const g = them
+    ? clamp01((silenceRadius - dist(me, them)) / (silenceRadius - fullGainRadius))
+    : 0;
+  chain.gain.gain.setTargetAtTime(g, ctx.currentTime, 0.05);
+}
 ```
 
 `setTargetAtTime` rather than assigning `.value`: direct assignment
 steps the gain and produces audible zipper noise. With instantaneous
 movement the 50ms time constant is doing real work, since it turns
 what would be a click on every teleport into a fast fade. It is the
-knob to turn if transitions sound abrupt or mushy.
+knob to turn if transitions sound abrupt or mushy. An unoccupied slot
+fades to zero through the same path.
 
 Linear falloff is the starting point because it is easy to reason
 about while tuning. Swapping in an inverse or exponential curve is a
@@ -296,33 +422,31 @@ one-line change once there is a feel to compare against.
 
 ### Rendering
 
-Canvas 2D. Each player is a circle drawn at its authoritative
-position; the local player is outlined. Draw two rings around the
-local player at `full_gain_radius` and `silence_radius` so falloff is
-visible while moving, which makes "does this sound right" answerable
-by looking.
+Canvas 2D. Each player is a circle at its authoritative position; the
+local player is outlined. Draw two rings around the local player at
+`full_gain_radius` and `silence_radius` so falloff is visible while
+moving, which makes "does this sound right" answerable by looking.
 
 A click converts canvas coordinates to world coordinates and sends a
 `move`.
 
-Render each peer's current gain as a number next to its dot during
-bring-up. Seeing the value makes it obvious whether a silence problem
-is in the math or in the audio graph.
+During bring-up, label each dot with its slot mid and current gain.
+Seeing both makes it immediately clear whether a silence problem is in
+the slot mapping, the distance math, or the audio graph.
 
 ## Deployment
 
-Four things must be reachable from a player's browser:
+One binary and one open UDP port.
+
+Three things must be reachable from a player's browser:
 
 - the frontend, over HTTPS
 - the game WebSocket, over WSS
-- LiveKit signaling, over WSS, proxied to `:7880`
-- LiveKit media, over UDP `:7882`, with TCP `:7881` as a fallback
+- the media port, over UDP
 
-The first three are ordinary HTTPS serving. Anything that terminates
-TLS with a valid certificate and proxies WebSockets is fine: nginx,
-Caddy, a managed ingress, or the Rust server itself holding the certs
-and proxying LiveKit. This plan assumes such a setup exists and does
-not specify it.
+The first two are ordinary HTTPS serving. Anything that terminates TLS
+with a valid certificate and proxies WebSockets is fine. This plan
+assumes such a setup exists and does not specify it.
 
 Two facts constrain the choice, and only these two:
 
@@ -333,83 +457,89 @@ Two facts constrain the choice, and only these two:
   forwards only HTTP and WebSocket will carry signaling but not media,
   so the media port needs a direct path to the host.
 
-Whatever address LiveKit advertises in its ICE candidates must be one
-clients can actually reach. `rtc.use_external_ip: true` makes it
-discover its own public address; `rtc.node_ip` sets it explicitly.
+Configuration:
 
-`docker-compose.yml` runs `livekit/livekit-server` with
-`network_mode: host`, mounting `livekit/livekit.yaml`:
-
-```yaml
-port: 7880
-rtc:
-  udp_port: 7882          # single-port UDP mux
-  use_external_ip: true   # false for local dev
-keys:
-  devkey: <long random secret>
+```
+PUBLIC_IP=203.0.113.7     # must match what clients can reach
+UDP_PORT=9001
+HTTP_PORT=8080
+MAX_PLAYERS=8
 ```
 
-A single muxed UDP port keeps the firewall rule to one line instead of
-a ten-thousand-port range.
-
-Resource use is small. The Rust server is idle at this scale and the
-SFU carries roughly 8 inbound streams plus 56 outbound, a few Mbps.
-The smallest VPS tier is adequate.
+Resource use is small. Forwarding Opus payloads for 8 players is 8
+inbound streams and 56 outbound, a few Mbps, with no codec work
+anywhere in the server. The smallest VPS tier is adequate.
 
 Local development needs no certificate, since `localhost` is a secure
-context: Vite on `:5173`, the Rust server on `:8080`, LiveKit at
-`ws://localhost:7880`, and `use_external_ip: false`.
-
-### Access
-
-The game server hands a LiveKit token to anyone who opens the
-WebSocket, so reaching the hostname is sufficient to join and talk.
-A shared secret in the connect query string, checked by the Rust
-server, is about ten lines if that matters.
+context: Vite on `:5173`, the server on `:8080`, and `PUBLIC_IP` set
+to `127.0.0.1`.
 
 ## Build order
 
-Each step ends in something runnable, and each isolates a different
-failure domain.
+Each step ends in something runnable, and each isolates one failure
+domain.
 
 **1. Movement, no audio.** WebSocket, broadcast on change, canvas,
 click to move. Done when two browser tabs show each other's dots
 jumping to clicked positions.
 
-**2. Voice, no spatialization.** LiveKit in docker, mic publish, every
-peer at gain 1.0. Done when 5-8 friends on their real home networks
-can all hear each other. This step tests NAT traversal and the
-deployment's media path, and is kept separate so a connection failure
-cannot be confused with an audio-graph failure.
+**2. One-way audio, two clients.** One browser publishes its mic, the
+server forwards to exactly one listener, hardcoded. This brings up ICE,
+DTLS, the str0m loop, and the forwarding path with the fewest moving
+parts, and it is where the hazards below will actually be found. Done
+when one tab can hear the other.
 
-**3. Distance gain.** Wire positions into the gain nodes, draw the
+**3. All-to-all at unity gain.** Real slot allocation, join and leave,
+`slots` messages, full lobby. Done when 5-8 friends on their own
+machines can all hear each other.
+
+**4. Distance gain.** Wire positions into the gain nodes, draw the
 radius rings. Done when moving away from someone audibly fades them
 out and the falloff feels right after tuning the two radii.
 
-**4. Filters and panning.** Insert a `StereoPannerNode` (or
-`PannerNode` with HRTF, which needs a facing direction added to the
-protocol) and a `BiquadFilterNode` into each chain. Low-pass cutoff
-driven by distance gives a muffled-at-range effect that reads as more
-natural than gain alone.
+**5. Filters and panning.** Insert a `StereoPannerNode` and a
+`BiquadFilterNode` into each chain. Low-pass cutoff driven by distance
+gives a muffled-at-range effect that reads as more natural than gain
+alone. `PannerNode` with HRTF is the richer option and needs a facing
+direction added to the protocol.
 
-Steps 1 through 3 are the prototype. Step 4 is the experiment the
+Steps 1 through 4 are the prototype. Step 5 is the experiment the
 prototype exists to enable.
 
 ## Known hazards
 
+Ordered roughly by how likely they are to cost an afternoon.
+
+- **`PUBLIC_IP` wrong** means ICE never completes and there is no
+  audio and no obvious error. With ice-lite there is exactly one
+  candidate, so if it is unreachable nothing else is tried. Check this
+  first, always. `chrome://webrtc-internals` shows whether any
+  candidate pair was nominated.
+- **A missing `poll_output` drain** after a mutation causes packets to
+  go unsent and timers to stall, which presents as audio that works
+  briefly and then stops.
+- **Forwarding the sender's payload type** to a listener that
+  negotiated a different one yields a stream the receiver discards or
+  decodes as noise.
+- **Silence with no error** in the browser is almost always the
+  missing muted `<audio>` sink, or an `AudioContext` that was never
+  resumed. Check in that order.
+- **Blocked UDP on one player's network** means that player alone
+  cannot connect while everyone else is fine. There is no fallback in
+  this design by assumption. The remedies, in increasing order of
+  effort, are ICE over TCP on a second port or a TURN server, and
+  neither is planned here.
+- **Slot reuse** after someone leaves and someone else joins makes an
+  RTP timestamp jump on an existing stream. Prefer unused slots, and
+  apply the per-slot offset described above if it is audible.
 - **Speakers cause echo.** Browser AEC is on, but with 8 participants
   on open speakers there will be feedback and talk-over. Require
   headphones for the first group test.
-- **Silence with no error** almost always means the missing muted
-  `<audio>` sink, or a chain accidentally built for the local
-  participant, or an `AudioContext` that was never resumed. Check in
-  that order.
-- **Identity mismatch** between the WebSocket player id and the
-  LiveKit participant identity produces audio at full volume that
-  never attenuates, because no position is ever found for the peer.
-- **Blocked UDP on a player's network** makes LiveKit fall back to
-  ICE over TCP on `:7881`. If one person cannot connect while everyone
-  else can, check that this port is reachable before looking anywhere
-  else.
+- **No reconnection logic exists.** A network hiccup drops the
+  WebSocket and the peer connection with no recovery path. The
+  intended response is reloading the page, and anything better is out
+  of scope.
+- **`str0m` version drift.** Pin the exact version; the API changes
+  between releases and example code found online may not compile.
 - **Firefox and Safari** will mostly work but are not worth debugging
   during bring-up. Standardize on Chrome for the first group test.
