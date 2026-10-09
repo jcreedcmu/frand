@@ -31,22 +31,35 @@ that forwards only HTTP and WebSocket carries signaling but not media.
 ## What works so far
 
 All of it: movement, everyone hearing everyone else, and distance driving
-volume, stereo position, and a low-pass cutoff. A row of checkboxes above the
-canvas mutes individual participants for you alone; the server is not told
-and the other players cannot tell.
+volume, stereo position, a low-pass cutoff, and how much of a voice arrives
+as reverb rather than directly. A row of checkboxes above the canvas mutes
+individual participants for you alone; the server is not told and the other
+players cannot tell.
 
 Every tuning knob is in `web/src/consts.ts`. `FULL_GAIN_RADIUS` and
 `SILENCE_RADIUS` bound the volume falloff and are drawn as dashed rings
-around your own dot, and `GAIN_FALLOFF` shapes the curve between them.
+around your own dot, and `GAIN_DROP_DB` sets how much level is lost across
+the band between them.
 `NEAR_CUTOFF_HZ` and `FAR_CUTOFF_HZ` bound the filter, which spans the whole
 distance from zero to `SILENCE_RADIUS` rather than just the falloff band.
 `PAN_WIDTH` caps how far a voice moves off centre. Each other dot is
 labelled with its slot, gain, and cutoff, so what you are hearing is visible.
 
-Distance is carried mostly by the filter rather than by volume: a voice holds
-near full level across most of the range while its cutoff falls from 10kHz to
-300Hz. The two curves live in `slotSpatial` in `web/src/audio.ts` and are a
-line each.
+Three cues move together. Volume follows an exponential decay, losing
+`GAIN_DROP_DB` across the falloff band, which works out to a near constant
+drop in decibels per unit distance; the cutoff falls geometrically from 10kHz
+to 300Hz; the reverb send rises from nothing to `WET_MAX`. All three are
+geometric rather than linear for the same reason: level, pitch, and
+reverberation are all heard as ratios, so a curve that is even in amplitude
+sounds uneven. The curves live in `slotSpatial` in `web/src/audio.ts` and are
+a line each.
+
+The reverb is one bus shared by every slot, with a per-slot send level, and
+its impulse response is generated at startup rather than loaded, so there is
+no audio asset to ship. `REVERB_SECONDS` and `REVERB_DECAY` set how long the
+room rings, `REVERB_PREDELAY` how far away the nearest wall sounds,
+`REVERB_TONE_HZ` how bright the tail is, and `REVERB_LEVEL` trims the whole
+bus. The defaults are a small room: an RT60 of about half a second.
 
 The server logs one line per connection as it comes up (`rtc m-lines`,
 `rtc connected`), one the first time a microphone produces a frame, and one

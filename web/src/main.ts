@@ -19,6 +19,8 @@ const roster = createRoster(people, () => {
 
 let conn: Conn | null = null;
 let audio: AudioContext | null = null;
+let peer: RTCPeerConnection | null = null;
+let mic: MediaStream | null = null;
 let chains: Chain[] = [];
 let spatial: Spatial[] = [];
 
@@ -48,7 +50,7 @@ async function join(): Promise<void> {
     audio = new AudioContext();
     await audio.resume();
 
-    const mic = await navigator.mediaDevices.getUserMedia({
+    mic = await navigator.mediaDevices.getUserMedia({
       audio: {
         echoCancellation: true,
         noiseSuppression: true,
@@ -67,8 +69,7 @@ async function join(): Promise<void> {
       onAnswer: (sdp) => deliverAnswer(sdp),
       onClose: () => {
         conn = null;
-        chains = [];
-        spatial = [];
+        teardown();
         joinButton.disabled = false;
         status.textContent = 'disconnected';
       },
@@ -76,6 +77,7 @@ async function join(): Promise<void> {
 
     status.textContent = 'negotiating...';
     const { pc, sdp } = await createOffer(mic.getAudioTracks()[0], conn.slotCount);
+    peer = pc;
     chains = buildChains(audio, pc, conn.slotCount, sinks);
     conn.sendOffer(sdp);
     await pc.setRemoteDescription({ type: 'answer', sdp: await answer });
@@ -84,9 +86,27 @@ async function join(): Promise<void> {
     update(conn.players);
   } catch (err) {
     conn = null;
+    teardown();
     joinButton.disabled = false;
     status.textContent = `failed: ${(err as Error).message}`;
   }
+}
+
+/**
+ * Rejoining builds a fresh context, peer connection, and set of chains, so
+ * the previous ones have to go: an `AudioContext` left open keeps its reverb
+ * convolver running, and the sink elements would accumulate in the DOM.
+ */
+function teardown(): void {
+  peer?.close();
+  peer = null;
+  mic?.getTracks().forEach((track) => track.stop());
+  mic = null;
+  void audio?.close();
+  audio = null;
+  sinks.replaceChildren();
+  chains = [];
+  spatial = [];
 }
 
 /**
