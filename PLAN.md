@@ -151,8 +151,9 @@ change keeps the cost flat in player count, and `watch` keeps only the
 latest value, so a slow client misses snapshots instead of needing lag
 handling.
 
-`World` holds the player map and a `[Option<PlayerId>; 16]` slot table.
-Joining takes the lowest free index, or fails when there is none.
+`World` holds the player map and a `Vec<Option<PlayerId>>` slot table,
+sized at startup from `MAX_PLAYERS`. Joining takes the lowest free
+index, or fails when there is none.
 
 **The SFU** is one tokio task owning the UDP socket and every `Rtc`, so
 no locking is needed around WebRTC state. WebSocket tasks reach it over
@@ -233,20 +234,11 @@ it in a loop, or the call stack grows with the lobby.
 
 ### Forwarding
 
-`Event::MediaData` carries one Opus frame from one player. Write it to
-that player's slot in every other connection:
-
-```rust
-let slot = peers[&sender_id].slot;
-for (listener_id, listener) in peers.iter_mut() {
-    if *listener_id == sender_id { continue }
-    let mid = listener.recv_mids[slot];
-    let Some(writer) = listener.rtc.writer(mid) else { continue };
-    let pt = writer.payload_params().next().unwrap().pt();
-    writer.write(pt, data.network_time, data.time, &data.data)?;
-    drain(&mut listener.rtc, &socket)?;   // the mutation rule applies
-}
-```
+`Event::MediaData` carries one Opus frame from one player. Look up that
+player's slot, and for every other connection, take the writer for the
+m-line that connection gave to the slot and write the payload through
+unchanged, draining that connection before moving on to the next
+listener.
 
 `recv_mids` is built during the join drain from the `Event::MediaAdded`
 sequence, dropping the first (the client's mic) so that `recv_mids[s]`
