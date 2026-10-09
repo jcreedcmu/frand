@@ -30,8 +30,23 @@ that forwards only HTTP and WebSocket carries signaling but not media.
 
 ## What works so far
 
-Movement, and everyone hearing everyone else at full volume. Distance does
-not affect gain yet.
+All of it: movement, everyone hearing everyone else, and distance driving
+volume, stereo position, and a low-pass cutoff. A row of checkboxes above the
+canvas mutes individual participants for you alone; the server is not told
+and the other players cannot tell.
+
+Every tuning knob is in `web/src/consts.ts`. `FULL_GAIN_RADIUS` and
+`SILENCE_RADIUS` bound the volume falloff and are drawn as dashed rings
+around your own dot, and `GAIN_FALLOFF` shapes the curve between them.
+`NEAR_CUTOFF_HZ` and `FAR_CUTOFF_HZ` bound the filter, which spans the whole
+distance from zero to `SILENCE_RADIUS` rather than just the falloff band.
+`PAN_WIDTH` caps how far a voice moves off centre. Each other dot is
+labelled with its slot, gain, and cutoff, so what you are hearing is visible.
+
+Distance is carried mostly by the filter rather than by volume: a voice holds
+near full level across most of the range while its cutoff falls from 10kHz to
+300Hz. The two curves live in `slotSpatial` in `web/src/audio.ts` and are a
+line each.
 
 The server logs one line per connection as it comes up (`rtc m-lines`,
 `rtc connected`), one the first time a microphone produces a frame, and one

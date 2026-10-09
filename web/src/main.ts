@@ -1,19 +1,26 @@
-import { buildChains } from './audio.js';
-import type { Chain } from './audio.js';
+import { applySpatial, buildChains, slotSpatial } from './audio.js';
+import type { Chain, Spatial } from './audio.js';
 import type { Conn, Player } from './net.js';
 import { connect } from './net.js';
 import { draw, prepare, toWorld } from './render.js';
 import { createOffer } from './rtc.js';
+import { createRoster } from './roster.js';
 
 const nameInput = document.getElementById('name') as HTMLInputElement;
 const joinButton = document.getElementById('join') as HTMLButtonElement;
 const status = document.getElementById('status') as HTMLSpanElement;
 const canvas = document.getElementById('world') as HTMLCanvasElement;
 const sinks = document.getElementById('sinks') as HTMLDivElement;
+const people = document.getElementById('people') as HTMLDivElement;
 const ctx2d = prepare(canvas);
+const roster = createRoster(people, () => {
+  if (conn) update(conn.players);
+});
 
 let conn: Conn | null = null;
+let audio: AudioContext | null = null;
 let chains: Chain[] = [];
+let spatial: Spatial[] = [];
 
 joinButton.addEventListener('click', join);
 nameInput.addEventListener('keydown', (ev) => {
@@ -38,7 +45,7 @@ async function join(): Promise<void> {
 
   try {
     status.textContent = 'starting audio...';
-    const audio = new AudioContext();
+    audio = new AudioContext();
     await audio.resume();
 
     const mic = await navigator.mediaDevices.getUserMedia({
@@ -56,11 +63,12 @@ async function join(): Promise<void> {
     });
 
     conn = await connect(name, {
-      onState: describe,
+      onState: update,
       onAnswer: (sdp) => deliverAnswer(sdp),
       onClose: () => {
         conn = null;
         chains = [];
+        spatial = [];
         joinButton.disabled = false;
         status.textContent = 'disconnected';
       },
@@ -73,7 +81,7 @@ async function join(): Promise<void> {
     await pc.setRemoteDescription({ type: 'answer', sdp: await answer });
 
     nameInput.disabled = true;
-    describe(conn.players);
+    update(conn.players);
   } catch (err) {
     conn = null;
     joinButton.disabled = false;
@@ -81,17 +89,30 @@ async function join(): Promise<void> {
   }
 }
 
+/**
+ * A snapshot is the only thing that changes a gain, since positions are the
+ * only input to the falloff and they only ever arrive this way.
+ */
+function update(players: Player[]): void {
+  if (!conn) return;
+  spatial = slotSpatial(players, conn.myId, conn.slotCount, roster.muted);
+  if (audio) applySpatial(audio, chains, spatial);
+  roster.update(players, conn.myId, spatial);
+  describe(players);
+}
+
 /** The slot is worth showing: it is what the server log lines are keyed by. */
 function describe(players: Player[]): void {
   if (!conn) return;
   const me = players.find((p) => p.id === conn?.myId);
   const others = players.filter((p) => p.id !== conn?.myId).length;
+  const audible = spatial.filter((heard) => heard.gain > 0.01).length;
   status.textContent =
-    `${conn.myId} in slot ${me?.slot ?? '?'}, hearing ${others} of ${chains.length} slots`;
+    `${conn.myId} in slot ${me?.slot ?? '?'}, ${audible} of ${others} audible`;
 }
 
 function frame(): void {
-  if (conn) draw(ctx2d, conn.players, conn.myId);
+  if (conn) draw(ctx2d, conn.players, conn.myId, spatial);
   requestAnimationFrame(frame);
 }
 requestAnimationFrame(frame);

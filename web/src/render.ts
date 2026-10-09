@@ -1,4 +1,5 @@
-import { WORLD_H, WORLD_W } from './consts.js';
+import { FULL_GAIN_RADIUS, SILENCE_RADIUS, WORLD_H, WORLD_W } from './consts.js';
+import type { Spatial } from './audio.js';
 import type { Player } from './net.js';
 
 const DOT_RADIUS = 14;
@@ -23,29 +24,60 @@ export function toWorld(
   };
 }
 
+/**
+ * Each dot carries its slot index, gain, and cutoff, which is what makes
+ * "does this sound right" answerable by looking: the numbers separate a slot
+ * mapping problem from a distance one from an audio graph one.
+ */
 export function draw(
   ctx: CanvasRenderingContext2D,
   players: Player[],
   myId: string,
+  spatial: Spatial[],
 ): void {
   ctx.clearRect(0, 0, WORLD_W, WORLD_H);
 
+  const me = players.find((p) => p.id === myId);
+  if (me) drawRings(ctx, me);
+
   for (const p of players) {
-    const me = p.id === myId;
+    const mine = p.id === myId;
 
     ctx.beginPath();
     ctx.arc(p.x, p.y, DOT_RADIUS, 0, Math.PI * 2);
-    ctx.fillStyle = me ? '#7fb2ff' : '#8f98a8';
+    ctx.fillStyle = mine ? '#7fb2ff' : '#8f98a8';
     ctx.fill();
-    if (me) {
+    if (mine) {
       ctx.lineWidth = 3;
       ctx.strokeStyle = '#e8e8ea';
       ctx.stroke();
     }
 
+    const heard = spatial[p.slot];
+    const label = mine
+      ? `${p.name} [${p.slot}]`
+      : `${p.name} [${p.slot}] ${heard.gain.toFixed(2)} ${kilohertz(heard.cutoff)}`;
     ctx.fillStyle = '#e8e8ea';
     ctx.font = '16px system-ui, sans-serif';
     ctx.textAlign = 'center';
-    ctx.fillText(`${p.name} [${p.slot}]`, p.x, p.y - DOT_RADIUS - 8);
+    ctx.fillText(label, p.x, p.y - DOT_RADIUS - 8);
   }
+}
+
+function kilohertz(hz: number): string {
+  return `${(hz / 1000).toFixed(1)}k`;
+}
+
+/** Full volume and no filtering inside the inner ring, silence outside the
+ *  outer one. */
+function drawRings(ctx: CanvasRenderingContext2D, me: Player): void {
+  ctx.setLineDash([6, 6]);
+  ctx.lineWidth = 1;
+  for (const radius of [FULL_GAIN_RADIUS, SILENCE_RADIUS]) {
+    ctx.beginPath();
+    ctx.arc(me.x, me.y, radius, 0, Math.PI * 2);
+    ctx.strokeStyle = radius === FULL_GAIN_RADIUS ? '#4d6b99' : '#3a4250';
+    ctx.stroke();
+  }
+  ctx.setLineDash([]);
 }

@@ -23,6 +23,27 @@
       #status {
         color: #9aa0ab;
       }
+      #people {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        padding: 0 12px 10px;
+      }
+      #people .hint {
+        color: #9aa0ab;
+      }
+      #people .list {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 14px;
+      }
+      #people label {
+        display: flex;
+        align-items: center;
+        gap: 5px;
+        cursor: pointer;
+        user-select: none;
+      }
       canvas {
         display: block;
         width: calc(100vw - 24px);
@@ -42,6 +63,7 @@
       <button id="join">Join</button>
       <span id="status">not connected</span>
     </div>
+    <div id="people" hidden></div>
     <canvas id="world"></canvas>
     <div id="sinks" hidden></div>
     <script type="module" src="./dist/main.js"></script>
