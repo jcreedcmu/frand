@@ -9,6 +9,7 @@ export type Player = {
 type ServerMsg =
   | { t: 'welcome'; id: string; slot_count: number }
   | { t: 'rejected'; reason: string }
+  | { t: 'answer'; sdp: string }
   | { t: 'state'; players: Player[] };
 
 export type Conn = {
@@ -17,10 +18,12 @@ export type Conn = {
   /** Latest authoritative snapshot. */
   players: Player[];
   move(x: number, y: number): void;
+  sendOffer(sdp: string): void;
 };
 
 export type Handlers = {
   onState(players: Player[]): void;
+  onAnswer(sdp: string): void;
   onClose(): void;
 };
 
@@ -43,11 +46,15 @@ export function connect(name: string, handlers: Handlers): Promise<Conn> {
             slotCount: msg.slot_count,
             players: [],
             move: (x, y) => ws.send(JSON.stringify({ t: 'move', x, y })),
+            sendOffer: (sdp) => ws.send(JSON.stringify({ t: 'offer', sdp })),
           };
           resolve(conn);
           break;
         case 'rejected':
           reject(new Error(msg.reason));
+          break;
+        case 'answer':
+          handlers.onAnswer(msg.sdp);
           break;
         case 'state':
           if (conn) {

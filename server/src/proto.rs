@@ -8,11 +8,13 @@ use serde::{Deserialize, Serialize};
 pub enum ServerMsg<'a> {
     Welcome { id: &'a str, slot_count: usize },
     Rejected { reason: &'a str },
+    Answer { sdp: &'a str },
 }
 
 #[derive(Deserialize)]
 #[serde(tag = "t", rename_all = "snake_case")]
 pub enum ClientMsg {
+    Offer { sdp: String },
     Move { x: f32, y: f32 },
 }
 
