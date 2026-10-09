@@ -1,4 +1,10 @@
-import { FULL_GAIN_RADIUS, SILENCE_RADIUS, WORLD_H, WORLD_W } from './consts.js';
+import {
+  DOT_GROWTH,
+  FULL_GAIN_RADIUS,
+  SILENCE_RADIUS,
+  WORLD_H,
+  WORLD_W,
+} from './consts.js';
 import type { Spatial } from './audio.js';
 import type { Player } from './net.js';
 
@@ -34,6 +40,7 @@ export function draw(
   players: Player[],
   myId: string,
   spatial: Spatial[],
+  levels: number[],
 ): void {
   ctx.clearRect(0, 0, WORLD_W, WORLD_H);
 
@@ -43,8 +50,12 @@ export function draw(
   for (const p of players) {
     const mine = p.id === myId;
 
+    // Size tracks how loud this player is right now, which is approximate by
+    // design: it is there to tell you who is talking at a glance.
+    const radius = DOT_RADIUS * (1 + DOT_GROWTH * (levels[p.slot] ?? 0));
+
     ctx.beginPath();
-    ctx.arc(p.x, p.y, DOT_RADIUS, 0, Math.PI * 2);
+    ctx.arc(p.x, p.y, radius, 0, Math.PI * 2);
     ctx.fillStyle = mine ? '#7fb2ff' : '#8f98a8';
     ctx.fill();
     if (mine) {
@@ -60,7 +71,7 @@ export function draw(
     ctx.fillStyle = '#e8e8ea';
     ctx.font = '16px system-ui, sans-serif';
     ctx.textAlign = 'center';
-    ctx.fillText(label, p.x, p.y - DOT_RADIUS - 8);
+    ctx.fillText(label, p.x, p.y - radius - 8);
   }
 }
 

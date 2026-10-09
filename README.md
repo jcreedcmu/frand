@@ -45,6 +45,12 @@ distance from zero to `SILENCE_RADIUS` rather than just the falloff band.
 `PAN_WIDTH` caps how far a voice moves off centre. Each other dot is
 labelled with its slot, gain, and cutoff, so what you are hearing is visible.
 
+Dots grow with how loud that player currently is, your own included, which is
+also the quickest check that a microphone is live. `LEVEL_FLOOR_DB`,
+`LEVEL_ATTACK`, `LEVEL_RELEASE`, and `DOT_GROWTH` tune the response. Levels
+are metered after the distance gain, so a muted dot stops moving and a
+distant one barely stirs.
+
 Three cues move together. Volume follows an exponential decay, losing
 `GAIN_DROP_DB` across the falloff band, which works out to a near constant
 drop in decibels per unit distance; the cutoff falls geometrically from 10kHz

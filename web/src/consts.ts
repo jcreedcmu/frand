@@ -66,5 +66,18 @@ export const REVERB_PREDELAY = 0.008;
  *  sound. Small rooms are brighter than large ones. */
 export const REVERB_TONE_HZ = 4500;
 
+/** Level at which a dot stops growing at all. Raise it towards -30 if idle
+ *  dots twitch on background noise. */
+export const LEVEL_FLOOR_DB = -45;
+
+/** How fast a dot follows the level up and back down again, per frame. Fast
+ *  up so a syllable registers, slow down so it does not flicker between
+ *  words. */
+export const LEVEL_ATTACK = 0.5;
+export const LEVEL_RELEASE = 0.08;
+
+/** How much larger a dot gets at full level, as a fraction of its radius. */
+export const DOT_GROWTH = 0.7;
+
 /** Trim for the whole reverb bus, applied after the convolver normalises. */
 export const REVERB_LEVEL = 0.9;

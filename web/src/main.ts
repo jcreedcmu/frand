@@ -1,5 +1,12 @@
-import { applySpatial, buildChains, slotSpatial } from './audio.js';
-import type { Chain, Spatial } from './audio.js';
+import {
+  applySpatial,
+  buildChains,
+  createMicMeter,
+  follow,
+  meterLevel,
+  slotSpatial,
+} from './audio.js';
+import type { Chain, Meter, Spatial } from './audio.js';
 import type { Conn, Player } from './net.js';
 import { connect } from './net.js';
 import { draw, prepare, toWorld } from './render.js';
@@ -23,6 +30,11 @@ let peer: RTCPeerConnection | null = null;
 let mic: MediaStream | null = null;
 let chains: Chain[] = [];
 let spatial: Spatial[] = [];
+let micMeter: Meter | null = null;
+/** Smoothed level per slot, driving dot size. */
+let levels: number[] = [];
+/** Our own slot, which carries no audio and so is free for our mic level. */
+let mySlot: number | null = null;
 
 joinButton.addEventListener('click', join);
 nameInput.addEventListener('keydown', (ev) => {
@@ -79,6 +91,7 @@ async function join(): Promise<void> {
     const { pc, sdp } = await createOffer(mic.getAudioTracks()[0], conn.slotCount);
     peer = pc;
     chains = buildChains(audio, pc, conn.slotCount, sinks);
+    micMeter = createMicMeter(audio, mic);
     conn.sendOffer(sdp);
     await pc.setRemoteDescription({ type: 'answer', sdp: await answer });
 
@@ -104,9 +117,12 @@ function teardown(): void {
   mic = null;
   void audio?.close();
   audio = null;
+  micMeter = null;
   sinks.replaceChildren();
   chains = [];
   spatial = [];
+  levels = [];
+  mySlot = null;
 }
 
 /**
@@ -115,6 +131,7 @@ function teardown(): void {
  */
 function update(players: Player[]): void {
   if (!conn) return;
+  mySlot = players.find((p) => p.id === conn?.myId)?.slot ?? null;
   spatial = slotSpatial(players, conn.myId, conn.slotCount, roster.muted);
   if (audio) applySpatial(audio, chains, spatial);
   roster.update(players, conn.myId, spatial);
@@ -132,7 +149,15 @@ function describe(players: Player[]): void {
 }
 
 function frame(): void {
-  if (conn) draw(ctx2d, conn.players, conn.myId, spatial);
+  if (conn) {
+    chains.forEach((chain, slot) => {
+      levels[slot] = follow(levels[slot] ?? 0, meterLevel(chain.meter));
+    });
+    if (mySlot !== null) {
+      levels[mySlot] = follow(levels[mySlot] ?? 0, micMeter ? meterLevel(micMeter) : 0);
+    }
+    draw(ctx2d, conn.players, conn.myId, spatial, levels);
+  }
   requestAnimationFrame(frame);
 }
 requestAnimationFrame(frame);

@@ -2,6 +2,9 @@ import {
   FAR_CUTOFF_HZ,
   FULL_GAIN_RADIUS,
   GAIN_DROP_DB,
+  LEVEL_ATTACK,
+  LEVEL_FLOOR_DB,
+  LEVEL_RELEASE,
   NEAR_CUTOFF_HZ,
   PAN_WIDTH,
   REVERB_DECAY,
@@ -37,6 +40,15 @@ export type Chain = {
   dry: GainNode;
   /** To the shared reverb bus. */
   wet: GainNode;
+  meter: Meter;
+};
+
+/** A tap for reading how loud a signal is right now. An `AnalyserNode` needs
+ *  no output connection to do its work, so this is a leaf of the graph. */
+export type Meter = {
+  analyser: AnalyserNode;
+  /** Reused every frame rather than reallocated. */
+  samples: Float32Array<ArrayBuffer>;
 };
 
 /** What one slot's position works out to at the listener's ears. */
@@ -101,11 +113,18 @@ export function buildChains(
     const wet = ctx.createGain();
     wet.gain.value = 0;
 
+    // Metered after the distance gain and before the reverb split, so the
+    // reading matches what is actually heard: muting stills it, and distance
+    // quiets it, while the reverb tail does not smear its envelope. Tap
+    // `panner` instead to show who is talking regardless of distance.
+    const meter = createMeter(ctx);
+
     source.connect(filter).connect(panner).connect(gain);
     gain.connect(dry).connect(ctx.destination);
     gain.connect(wet).connect(reverb);
+    gain.connect(meter.analyser);
 
-    chains.push({ sink, source, filter, panner, gain, dry, wet });
+    chains.push({ sink, source, filter, panner, gain, dry, wet, meter });
   }
 
   return chains;
@@ -178,6 +197,39 @@ export function applySpatial(
     chain.dry.gain.setTargetAtTime(1 - want.wet, ctx.currentTime, RAMP_SECONDS);
     chain.wet.gain.setTargetAtTime(want.wet, ctx.currentTime, RAMP_SECONDS);
   });
+}
+
+/** Meters the microphone so the local player's own dot moves too, which also
+ *  answers "is my microphone working" without anyone else present. */
+export function createMicMeter(ctx: AudioContext, mic: MediaStream): Meter {
+  const meter = createMeter(ctx);
+  // Never connected onward: monitoring your own mic is immediate feedback.
+  ctx.createMediaStreamSource(mic).connect(meter.analyser);
+  return meter;
+}
+
+function createMeter(ctx: AudioContext): Meter {
+  const analyser = ctx.createAnalyser();
+  analyser.fftSize = 256;
+  return { analyser, samples: new Float32Array(analyser.fftSize) };
+}
+
+/** Current level as 0 to 1, mapped through decibels because that is how the
+ *  loudness it stands for is heard. */
+export function meterLevel(meter: Meter): number {
+  meter.analyser.getFloatTimeDomainData(meter.samples);
+  let sum = 0;
+  for (const sample of meter.samples) sum += sample * sample;
+  const rms = Math.sqrt(sum / meter.samples.length);
+  if (rms <= 0) return 0;
+  const db = 20 * Math.log10(rms);
+  return clamp01((db - LEVEL_FLOOR_DB) / -LEVEL_FLOOR_DB);
+}
+
+/** Envelope follower: fast up, slow down. */
+export function follow(previous: number, target: number): number {
+  const rate = target > previous ? LEVEL_ATTACK : LEVEL_RELEASE;
+  return previous + (target - previous) * rate;
 }
 
 /** Input node of the shared reverb: send here, it arrives at the output. */
