@@ -81,16 +81,13 @@ async function join(): Promise<void> {
   }
 }
 
-/**
- * Step 2 forwards slot 0 to slot 1 and nothing else, so the status line names
- * the slot: it is the difference between "this is broken" and "this tab is
- * not part of the one wired direction".
- */
+/** The slot is worth showing: it is what the server log lines are keyed by. */
 function describe(players: Player[]): void {
   if (!conn) return;
   const me = players.find((p) => p.id === conn?.myId);
-  const role = me?.slot === 0 ? 'talking' : me?.slot === 1 ? 'listening' : 'idle';
-  status.textContent = `${conn.myId} in slot ${me?.slot ?? '?'} (${role}), ${chains.length} chains`;
+  const others = players.filter((p) => p.id !== conn?.myId).length;
+  status.textContent =
+    `${conn.myId} in slot ${me?.slot ?? '?'}, hearing ${others} of ${chains.length} slots`;
 }
 
 function frame(): void {

@@ -20,12 +20,6 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::state::PlayerId;
 
-/// Step 2 carries exactly one direction, so a silence problem can only be in
-/// one place: whoever holds slot 0 is heard by whoever holds slot 1, and by
-/// nobody else.
-const TALKER_SLOT: usize = 0;
-const LISTENER_SLOT: usize = 1;
-
 /// How long the loop sleeps when no connection has a deadline of its own.
 const IDLE_POLL: Duration = Duration::from_millis(100);
 
@@ -71,14 +65,14 @@ struct Peer {
     listen: Vec<Mid>,
     deadline: Instant,
     /// Bring-up only: whether this connection has delivered a mic frame, and
-    /// whether anything has been written to it.
+    /// which slots have ever been written to it.
     heard_from: bool,
-    written_to: bool,
+    written: Vec<bool>,
 }
 
 /// Media to hand to listeners, queued rather than handled inline: writing to a
-/// listener produces output of its own, and recursing would grow the call
-/// stack with the lobby.
+/// listener produces output of its own, and handling that inline would grow
+/// the call stack with the lobby.
 struct Forward {
     from_slot: usize,
     data: MediaData,
@@ -225,7 +219,7 @@ impl Sfu {
             listen: Vec::new(),
             deadline: Instant::now(),
             heard_from: false,
-            written_to: false,
+            written: vec![false; self.slot_count],
         });
         eprintln!("rtc negotiated {id} slot={slot}");
         Ok(answer.to_sdp_string())
@@ -272,26 +266,24 @@ impl Sfu {
         self.drain(index).await;
     }
 
-    /// Drains one connection and then delivers whatever it produced. Each
-    /// write to a listener is itself a mutation, so that listener is drained
-    /// before anything else touches it.
+    /// Drains one connection, then hands each frame it produced to every
+    /// other connection. Each write is itself a mutation, so a listener is
+    /// drained before the next listener is touched, and frames the listeners
+    /// produce in turn go back on the queue instead of nesting.
     async fn drain(&mut self, index: usize) {
         let mut forwards = VecDeque::new();
         self.poll_until_timeout(index, &mut forwards).await;
 
         while let Some(forward) = forwards.pop_front() {
-            if forward.from_slot != TALKER_SLOT {
-                continue;
-            }
-            let Some(listener) = self
-                .peers
-                .iter()
-                .position(|peer| peer.slot == LISTENER_SLOT)
-            else {
-                continue;
-            };
-            if write_to(&mut self.peers[listener], forward.from_slot, &forward.data) {
-                self.poll_until_timeout(listener, &mut forwards).await;
+            for listener in 0..self.peers.len() {
+                // A player is never sent their own voice; their own slot
+                // stays idle in their own connection.
+                if self.peers[listener].slot == forward.from_slot {
+                    continue;
+                }
+                if write_to(&mut self.peers[listener], forward.from_slot, &forward.data) {
+                    self.poll_until_timeout(listener, &mut forwards).await;
+                }
             }
         }
     }
@@ -393,9 +385,11 @@ fn write_to(listener: &mut Peer, slot: usize, data: &MediaData) -> bool {
         listener.rtc.disconnect();
         return false;
     }
-    if !listener.written_to {
-        listener.written_to = true;
-        eprintln!("rtc first frame written to {} for slot {slot} pt={pt}", listener.id);
+    if let Some(first) = listener.written.get_mut(slot) {
+        if !*first {
+            *first = true;
+            eprintln!("rtc {} now hears slot {slot} pt={pt}", listener.id);
+        }
     }
     true
 }
