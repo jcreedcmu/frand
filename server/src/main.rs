@@ -4,11 +4,13 @@ mod state;
 mod ws;
 
 use std::net::{IpAddr, SocketAddr};
+use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::Arc;
 
 use axum::routing::get;
 use axum::Router;
+use axum_server::tls_rustls::RustlsConfig;
 use str0m::Candidate;
 use tokio::net::UdpSocket;
 use tower_http::services::ServeDir;
@@ -48,11 +50,48 @@ async fn main() {
         .fallback_service(ServeDir::new(&web_root).append_index_html_on_directories(true))
         .with_state(app);
 
-    let listener = tokio::net::TcpListener::bind(("0.0.0.0", http_port))
+    let addr = SocketAddr::from(([0, 0, 0, 0], http_port));
+    let service = router.into_make_service();
+    match tls_config().await {
+        Some(tls) => {
+            eprintln!("serving {web_root} on https://localhost:{http_port} (max_players={max_players})");
+            axum_server::bind_rustls(addr, tls).serve(service).await
+        }
+        None => {
+            eprintln!("serving {web_root} on http://localhost:{http_port} (max_players={max_players})");
+            axum_server::bind(addr).serve(service).await
+        }
+    }
+    .expect("server runs");
+}
+
+/// Browsers expose `getUserMedia` and `RTCPeerConnection` only in a secure
+/// context, so reaching the prototype from another machine on the LAN needs
+/// TLS. A self-signed certificate is enough, as long as its SAN carries the
+/// address the browser connects to; accepting the warning once also covers
+/// the same-origin `wss://` upgrade.
+async fn tls_config() -> Option<RustlsConfig> {
+    let cert = path_env("TLS_CERT", "cert.pem");
+    let key = path_env("TLS_KEY", "key.pem");
+    if !cert.exists() || !key.exists() {
+        eprintln!(
+            "no certificate at {} and {}; serving plain http",
+            cert.display(),
+            key.display()
+        );
+        return None;
+    }
+    let config = RustlsConfig::from_pem_file(&cert, &key)
         .await
-        .expect("http port is free");
-    eprintln!("serving {web_root} on http://localhost:{http_port} (max_players={max_players})");
-    axum::serve(listener, router).await.expect("server runs");
+        .unwrap_or_else(|err| panic!("cannot load {}: {err}", cert.display()));
+    Some(config)
+}
+
+fn path_env(key: &str, default: &str) -> PathBuf {
+    match std::env::var(key) {
+        Ok(raw) => PathBuf::from(raw),
+        Err(_) => PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(default),
+    }
 }
 
 /// One socket per advertised address. `str0m` discards STUN whose destination

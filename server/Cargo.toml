@@ -5,6 +5,7 @@ edition = "2021"
 
 [dependencies]
 axum = { version = "0.8", features = ["ws"] }
+axum-server = { version = "0.7", features = ["tls-rustls"] }
 futures-util = "0.3"
 if-addrs = "0.15.0"
 serde = { version = "1", features = ["derive"] }
